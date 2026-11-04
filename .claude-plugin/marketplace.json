@@ -1,0 +1,5 @@
+{
+  "name": "claude-code-kanban-board",
+  "owner": { "name": "Otto Coster" },
+  "plugins": [{ "name": "agent-board", "source": "./" }]
+}

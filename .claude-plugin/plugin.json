@@ -1,0 +1,6 @@
+{
+  "name": "agent-board",
+  "version": "0.1.0",
+  "description": "A Kanban board pane for Claude and its subagents, stored as one Markdown file per card in the repo's .board/cards/",
+  "types": "./types/index.d.ts"
+}
