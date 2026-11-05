@@ -9,20 +9,25 @@ const PANE = 'agent-board'
 const CARDS_DIR = '.board/cards'
 const POLL_MS = 3000
 
+// Waiting for input comes first: it is what needs the user, so it sits where
+// the eye starts. The rest is the flow of work, left to right.
 const COLUMNS: { id: Column; label: string }[] = [
+  { id: 'waiting', label: 'Waiting for input' },
   { id: 'backlog', label: 'Backlog' },
   { id: 'todo', label: 'To do' },
   { id: 'doing', label: 'Doing' },
   { id: 'reviewing', label: 'Reviewing' },
   { id: 'done', label: 'Done' },
-  { id: 'waiting', label: 'Waiting for input' },
 ]
 const COLUMN_IDS = COLUMNS.map(c => c.id)
+// The flow the chevrons step through. Waiting is off to the side: a card
+// goes there to ask, and leaves it for To do.
+const FLOW = COLUMNS.filter(c => c.id !== 'waiting')
 const labelOf = (column: Column) => COLUMNS.find(c => c.id === column)?.label ?? column
 
 // What the pane draws from. Change the shape tag when Card's fields change.
 const cards = atom({ plugin: 'agent-board', key: 'cards' } as const, [], {
-  shape: 'cards-2',
+  shape: 'cards-3',
 })
 // The card open in the detail view; 0 is the board itself.
 const selected = atom({ plugin: 'agent-board', key: 'selected' } as const, 0)
@@ -32,13 +37,23 @@ const boardDir = atom({ plugin: 'agent-board', key: 'boardDir' } as const, '')
 const confirmDelete = atom({ plugin: 'agent-board', key: 'confirmDelete' } as const, 0)
 // Columns folded open in the narrow layout (Backlog and Done start folded).
 const expanded = atom({ plugin: 'agent-board', key: 'expanded' } as const, [] as string[])
+// Last tool call per agent, so a tile can show who is working right now.
+const activity = atom({ plugin: 'agent-board', key: 'activity' } as const, {} as Record<string, number>)
+// Bumped on a timer so "5m ago" and idle states redraw.
+const tick = atom({ plugin: 'agent-board', key: 'tick' } as const, 0)
+
+// A claim lapses after this long without the holder doing anything, so a
+// card held by an agent that died is never stuck.
+const CLAIM_TTL_MS = 30 * 60_000
+// Within this long of the holder's last tool call, the card shows as working.
+const WORKING_MS = 2 * 60_000
 
 // ---------------------------------------------------------------------------
 // Card files: .board/cards/<id>.md, YAML-ish front matter, the description,
 // then comments, each behind a marker line so free text can't break parsing.
 
 const COMMENTS_MARK = '<!-- comments -->'
-const COMMENT_RE = /<!-- comment at="([^"]*)" author="([^"]*)" -->\n/g
+const COMMENT_RE = /<!-- comment at="([^"]*)" author="([^"]*)"(?: kind="([^"]*)")? -->\n/g
 
 const clean = (s: string) => s.replace(/["\n\r]/g, ' ').trim()
 
@@ -52,6 +67,9 @@ function serialize(card: Card): string {
     `created: ${card.created}`,
     `updated: ${card.updated}`,
   ]
+  if (card.holder) {
+    lines.push(`holder: ${JSON.stringify(card.holder)}`, `assignee: ${JSON.stringify(card.assignee)}`, `claimed: ${card.claimedAt}`)
+  }
   // One line of JSON, so the front matter stays one key per line.
   if (card.question) lines.push(`question: ${JSON.stringify(card.question)}`)
   lines.push('---', '')
@@ -62,7 +80,9 @@ function serialize(card: Card): string {
     for (const c of card.comments) {
       const at = clean(c.at)
       const author = clean(c.author)
-      text += `\n<!-- comment at="${at}" author="${author}" -->\n**${author}** · ${at}\n\n${c.text.trim()}\n`
+      const kind = c.kind ? ` kind="${c.kind}"` : ''
+      const tag = c.kind === 'handoff' ? ' · handoff' : ''
+      text += `\n<!-- comment at="${at}" author="${author}"${kind} -->\n**${author}**${tag} · ${at}\n\n${c.text.trim()}\n`
     }
   }
   return text
@@ -106,7 +126,7 @@ function parse(text: string): Card | undefined {
       const end = heads[i + 1]?.index ?? tail.length
       // Drop the "**author** · date" line drawn for human readers.
       const body = tail.slice(start, end).replace(/^\*\*[^\n]*\n/, '').trim()
-      comments.push({ at: m[1] ?? '', author: m[2] ?? '', text: body })
+      comments.push({ at: m[1] ?? '', author: m[2] ?? '', text: body, ...(m[3] === 'handoff' ? { kind: 'handoff' as const } : {}) })
     })
   }
   return {
@@ -118,6 +138,9 @@ function parse(text: string): Card | undefined {
     created: meta.created ?? '',
     updated: meta.updated ?? '',
     comments,
+    holder: meta.holder ?? '',
+    assignee: meta.assignee ?? '',
+    claimedAt: meta.claimed ?? '',
     ...(meta.question ? { question: parseQuestion(meta.question) } : {}),
   }
 }
@@ -203,6 +226,9 @@ async function createCard(
       created: now(),
       updated: now(),
       comments: [],
+      holder: '',
+      assignee: '',
+      claimedAt: '',
     }
     await saveCard($, card)
     await refresh($)
@@ -225,8 +251,34 @@ async function changeCard(
   })
 }
 
-async function moveCard($: Engine, id: number, column: Column): Promise<Card | undefined> {
-  const card = await changeCard($, id, c => ({ ...c, column }))
+// Who acts: an agent (its holder id and display name), or the user in the pane.
+type Actor = { holder: string; name: string }
+const unclaimed = { holder: '', assignee: '', claimedAt: '' }
+
+// Moving into Doing claims the card for the agent that moves it; moving it
+// anywhere else lets go, so the next agent (a reviewer, say) can take it.
+// A summary is saved as a handoff comment in the same write.
+async function moveCard(
+  $: Engine,
+  id: number,
+  column: Column,
+  opts: { by?: Actor; summary?: string } = {},
+): Promise<Card | undefined> {
+  const { by, summary } = opts
+  let released = ''
+  const card = await changeCard($, id, c => {
+    const comments = summary?.trim()
+      ? [...c.comments, { at: now(), author: by?.name ?? 'you', text: summary.trim(), kind: 'handoff' as const }]
+      : c.comments
+    let claim = { holder: c.holder, assignee: c.assignee, claimedAt: c.claimedAt }
+    if (column === 'doing' && by && c.holder !== by.holder) claim = { holder: by.holder, assignee: by.name, claimedAt: now() }
+    if (column !== 'doing') {
+      if (c.holder && !by && isLive(c)) released = c.assignee
+      claim = unclaimed
+    }
+    return { ...c, column, comments, ...claim }
+  })
+  if (card && released) $.ui.toast(`Released ${released}'s claim on #${card.id}`)
   if (card && column === 'waiting') {
     $.ui.toast(`#${card.id} is waiting for your input: ${card.title}`)
     // Not every host has native notifications (the desktop app answers no-surface).
@@ -253,7 +305,7 @@ async function addComment(
 
 async function askQuestion(
   $: Engine,
-  input: { id?: number; title?: string; description?: string; question: Question; author: string },
+  input: { id?: number; title?: string; description?: string; question: Question; author: string; by?: Actor },
 ): Promise<Card | undefined> {
   let id = input.id
   if (id === undefined) {
@@ -266,7 +318,7 @@ async function askQuestion(
     id = made.id
   }
   const card = await changeCard($, id, c => ({ ...c, question: input.question }))
-  if (card) await moveCard($, card.id, 'waiting')
+  if (card) await moveCard($, card.id, 'waiting', { by: input.by })
   return card
 }
 
@@ -358,13 +410,15 @@ async function findBoardDir($: Engine): Promise<string> {
 function summary(card: Card): string {
   const n = card.comments.length
   const q = isOpenQuestion(card) ? ' (question open)' : ''
-  return `#${card.id} [${labelOf(card.column)}] ${card.title}${n ? ` (${n} comment${n === 1 ? '' : 's'})` : ''}${q}`
+  const by = isLive(card) ? ` (claimed by ${card.assignee})` : ''
+  return `#${card.id} [${labelOf(card.column)}] ${card.title}${n ? ` (${n} comment${n === 1 ? '' : 's'})` : ''}${q}${by}`
 }
 
 function full(card: Card): string {
   const parts = [
     summary(card),
     `Created ${card.created} by ${card.author || 'unknown'}; updated ${card.updated}`,
+    ...(isLive(card) ? [`Claimed by ${card.assignee} since ${card.claimedAt}; last active ${lastActiveAgo(card)}`] : []),
     '',
     card.description || '(no description)',
   ]
@@ -377,7 +431,7 @@ function full(card: Card): string {
   }
   if (card.comments.length > 0) {
     parts.push('', 'Comments:')
-    for (const c of card.comments) parts.push(`- ${c.author} at ${c.at}: ${c.text}`)
+    for (const c of card.comments) parts.push(`- ${c.author}${c.kind === 'handoff' ? ' (handoff)' : ''} at ${c.at}: ${c.text}`)
   }
   return parts.join('\n')
 }
@@ -385,6 +439,132 @@ function full(card: Card): string {
 function authorOf(e: { agentId?: string; author?: unknown }): string {
   if (typeof e.author === 'string' && e.author.trim()) return clean(e.author).slice(0, 60)
   return e.agentId ? `subagent ${e.agentId.slice(0, 8)}` : 'claude'
+}
+
+// ---------------------------------------------------------------------------
+// Claims: one agent per card. The holder is the agent's loop id ('main' for
+// the main loop), so a subagent can't take over by signing another name.
+
+// When each agent last made a tool call: module memory, refilled as agents work.
+const lastSeen = new Map<string, number>()
+const holderOf = (e: { agentId?: string }) => e.agentId ?? 'main'
+const actorOf = (e: { agentId?: string; author?: unknown }): Actor => ({ holder: holderOf(e), name: authorOf(e) })
+
+const lastActive = (card: Card) => Math.max(lastSeen.get(card.holder) ?? 0, Date.parse(card.claimedAt) || 0)
+const isLive = (card: Card) => !!card.holder && Date.now() - lastActive(card) < CLAIM_TTL_MS
+const isWorking = (card: Card) => !!card.holder && Date.now() - lastActive(card) < WORKING_MS
+const lastActiveAgo = (card: Card) => ago(new Date(lastActive(card)).toISOString())
+
+function touch($: Engine, holder: string) {
+  const t = Date.now()
+  const before = lastSeen.get(holder) ?? 0
+  lastSeen.set(holder, t)
+  // Redraw only when it shows: the dot lights up, or at most every 30 s.
+  if (t - before > 30_000) void update($, activity, a => ({ ...a, [holder]: t }))
+}
+
+// The refusal an agent gets for touching a card someone else holds.
+function heldByOther(card: Card, by: Actor): string | undefined {
+  if (!isLive(card) || card.holder === by.holder) return undefined
+  const state = isWorking(card) ? 'working on it now' : `last active ${lastActiveAgo(card)}`
+  return (
+    `Refused: #${card.id} is claimed by ${card.assignee} (${state}). Only its holder or the user can move or edit it. ` +
+    'Take another card with board_next, or leave a board_comment on this one.'
+  )
+}
+
+function refuseClaim(card: Card, by: Actor): string | undefined {
+  const held = heldByOther(card, by)
+  if (held) return held
+  if (card.column === 'done') return `Refused: #${card.id} is already done.`
+  if (isOpenQuestion(card)) return `Refused: #${card.id} is waiting for the user's answer to: ${card.question?.text ?? ''}`
+  return undefined
+}
+
+const claimed = (card: Card, by: Actor): Card => ({
+  ...card,
+  holder: by.holder,
+  assignee: by.name,
+  claimedAt: now(),
+  updated: now(),
+  column: card.column === 'backlog' || card.column === 'todo' || card.column === 'waiting' ? 'doing' : card.column,
+})
+
+async function claimCard($: Engine, id: number, by: Actor): Promise<{ card?: Card; error?: string }> {
+  return locked(async () => {
+    const card = (await loadCards($)).find(c => c.id === id)
+    if (!card) return { error: `No card #${id}.` }
+    const error = refuseClaim(card, by)
+    if (error) return { error }
+    const next = claimed(card, by)
+    await saveCard($, next)
+    await refresh($)
+    return { card: next }
+  })
+}
+
+// Picks and claims in one locked step, so two agents asking at once never get
+// the same card.
+async function claimNext($: Engine, by: Actor): Promise<{ card?: Card; error?: string }> {
+  return locked(async () => {
+    const list = await loadCards($)
+    const mine = list.find(c => c.holder === by.holder && isLive(c) && c.column !== 'done')
+    if (mine) {
+      return {
+        error:
+          `You already hold #${mine.id} (${labelOf(mine.column)}): ${mine.title}. Finish it first ` +
+          '(board_move to reviewing or done, with a summary), or give it back with board_release.',
+      }
+    }
+    const card = list.find(c => c.column === 'todo' && !isLive(c) && !isOpenQuestion(c))
+    if (!card) {
+      const backlog = list.filter(c => c.column === 'backlog').length
+      return { error: `Nothing in To do to pick up.${backlog ? ` Backlog has ${backlog}; ask the user which to move to To do.` : ''}` }
+    }
+    const next = claimed(card, by)
+    await saveCard($, next)
+    await refresh($)
+    return { card: next }
+  })
+}
+
+// by: the agent asking (refused for a card someone else holds); absent: the user.
+async function releaseCard($: Engine, id: number, by?: Actor): Promise<{ card?: Card; error?: string }> {
+  return locked(async () => {
+    const card = (await loadCards($)).find(c => c.id === id)
+    if (!card) return { error: `No card #${id}.` }
+    const held = by && heldByOther(card, by)
+    if (held) return { error: held }
+    const next = { ...card, ...unclaimed, updated: now() }
+    await saveCard($, next)
+    await refresh($)
+    return { card: next }
+  })
+}
+
+// A subagent that ends while holding cards: put them back in To do with a
+// note, so nothing sits in Doing with nobody on it.
+async function releaseAbandoned($: Engine, holder: string): Promise<void> {
+  await locked(async () => {
+    const held = (await loadCards($)).filter(c => c.holder === holder)
+    for (const card of held) {
+      await saveCard($, {
+        ...card,
+        ...unclaimed,
+        column: card.column === 'doing' ? 'todo' : card.column,
+        updated: now(),
+        comments: [
+          ...card.comments,
+          {
+            at: now(),
+            author: 'board',
+            text: `Released automatically: ${card.assignee} finished without handing this card off.${card.column === 'doing' ? ' Moved back to To do.' : ''}`,
+          },
+        ],
+      })
+    }
+    if (held.length > 0) await refresh($)
+  })
 }
 
 const asColumn = (value: unknown): Column | undefined =>
@@ -397,7 +577,9 @@ const AUTHOR_SCHEMA = {
 }
 const BOARD_NOTE =
   'The board is shared by the user, the main Claude and every subagent, and is saved as Markdown files in the repo under .board/cards/. ' +
-  'Columns: backlog, todo, doing, reviewing, done, waiting (waiting = waiting for input from the user).'
+  'Columns: backlog, todo, doing, reviewing, done, waiting (waiting = waiting for input from the user). ' +
+  'Before working on a card, take one with board_next (or board_claim a specific one): it moves to doing and only you can move or edit it. ' +
+  'Moving to reviewing or done needs a summary, which hands the card off and releases it.'
 
 // ---------------------------------------------------------------------------
 
@@ -412,7 +594,7 @@ export const register: Register = on => {
       name: 'board_list',
       description:
         `List the cards on the project's Kanban board (id, column, title). ${BOARD_NOTE} ` +
-        'Check the board when starting work, and keep it current: move a card to doing when you start it, to reviewing when it needs review, to waiting when you need the user, and to done when finished.',
+        'Check the board when starting work, and keep it current: take a card with board_next, move it to reviewing (with a summary) when it needs review, use board_ask when you need the user, and move it to done (with a summary) when finished.',
       inputSchema: {
         type: 'object',
         properties: { column: { ...COLUMN_SCHEMA, description: 'Only list this column' } },
@@ -443,10 +625,19 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'board_move',
       description:
-        'Move a board card to another column. Move it to "waiting" when you need input from the user, and say what you need in a board_comment.',
+        'Move a board card to another column. Moving to "doing" claims it for you; moving anywhere else releases it. ' +
+        'Moving to "reviewing" or "done" requires a summary. To ask the user something, use board_ask rather than moving to "waiting".',
       inputSchema: {
         type: 'object',
-        properties: { id: { type: 'integer' }, column: COLUMN_SCHEMA },
+        properties: {
+          id: { type: 'integer' },
+          column: COLUMN_SCHEMA,
+          summary: {
+            type: 'string',
+            description:
+              'Required for reviewing and done: the handoff. What changed, where (files, branch), and how to check it.',
+          },
+        },
         required: ['id', 'column'],
       },
       isDeferred: false,
@@ -500,9 +691,38 @@ export const register: Register = on => {
       },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'board_next',
+      description:
+        'Take the next card to work on: the first unclaimed card in To do. It is claimed for you and moved to doing in one step, ' +
+        'so two agents never get the same card. Refused while you already hold an unfinished card. Returns the card in full.',
+      inputSchema: { type: 'object', properties: { author: AUTHOR_SCHEMA } },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'board_claim',
+      description:
+        'Claim a specific card to work on it (backlog, todo and waiting cards move to doing). Refused if another agent holds it, ' +
+        'it is done, or it waits for the user\'s answer. A claim lapses after 30 minutes without activity.',
+      inputSchema: {
+        type: 'object',
+        properties: { id: { type: 'integer' }, author: AUTHOR_SCHEMA },
+        required: ['id'],
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'board_release',
+      description: 'Give back a card you hold without finishing it, so another agent can take it. Say why in a board_comment.',
+      inputSchema: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] },
+      isDeferred: false,
+    })
 
     $.clock.every(POLL_MS, async () => {
       await refresh($)
+    })
+    $.clock.every(30_000, async () => {
+      await update($, tick, n => n + 1)
     })
 
     await pickPalette($)
@@ -524,6 +744,19 @@ export const register: Register = on => {
     await refresh($)
     await openPane($)
     return {}
+  })
+
+  // Every tool call, ours or not, counts as the agent being active.
+  on('tool.call', async ($, e, next) => {
+    touch($, holderOf(e))
+    return next(e)
+  })
+
+  // A subagent's turn ending is the subagent ending: free what it still holds.
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId) await releaseAbandoned($, e.agentId)
+    return result
   })
 
   // ---- Tools ---------------------------------------------------------------
@@ -558,10 +791,47 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'mcp__agent-board__board_move' }, async ($, e) => {
+    const by = actorOf(e)
+    touch($, by.holder)
     const column = asColumn(e.column)
     if (!column) return { result: `Unknown column. Use one of: ${COLUMN_IDS.join(', ')}.` }
-    const card = await moveCard($, Number(e.id), column)
+    const before = (await loadCards($)).find(c => c.id === Number(e.id))
+    if (!before) return { result: `No card #${String(e.id)}.` }
+    const held = heldByOther(before, by)
+    if (held) return { result: held }
+    const handoff = typeof e.summary === 'string' ? e.summary.trim() : ''
+    if ((column === 'reviewing' || column === 'done') && !handoff) {
+      return {
+        result:
+          `Refused: moving #${before.id} to ${labelOf(column)} needs a summary. Call board_move again with summary: ` +
+          'what changed, where (files, branch), and how to check it.',
+      }
+    }
+    if (column === 'waiting') {
+      return { result: `Use board_ask to move #${before.id} to Waiting for input: it puts your question to the user with options.` }
+    }
+    const card = await moveCard($, before.id, column, { by, summary: handoff })
     return { result: card ? `Moved ${summary(card)}` : `No card #${String(e.id)}.` }
+  })
+
+  on('tool.call', { tool: 'mcp__agent-board__board_next' }, async ($, e) => {
+    const by = actorOf(e)
+    touch($, by.holder)
+    const { card, error } = await claimNext($, by)
+    return { result: card ? `Claimed for you and moved to Doing:\n${full(card)}` : (error ?? '') }
+  })
+
+  on('tool.call', { tool: 'mcp__agent-board__board_claim' }, async ($, e) => {
+    const by = actorOf(e)
+    touch($, by.holder)
+    const { card, error } = await claimCard($, Number(e.id), by)
+    return { result: card ? `Claimed ${summary(card)}` : (error ?? '') }
+  })
+
+  on('tool.call', { tool: 'mcp__agent-board__board_release' }, async ($, e) => {
+    const by = actorOf(e)
+    const { card, error } = await releaseCard($, Number(e.id), by)
+    return { result: card ? `Released ${summary(card)}. Say why in a board_comment.` : (error ?? '') }
   })
 
   on('tool.call', { tool: 'mcp__agent-board__board_comment' }, async ($, e) => {
@@ -581,12 +851,18 @@ export const register: Register = on => {
     const wanted = typeof e.recommended === 'string' ? e.recommended.trim() : ''
     const recommended = options.some(o => o.label === wanted) ? wanted : ''
     const hasId = e.id !== undefined && e.id !== null
+    if (hasId) {
+      const before = (await loadCards($)).find(c => c.id === Number(e.id))
+      const held = before && heldByOther(before, actorOf(e))
+      if (held) return { result: held }
+    }
     const card = await askQuestion($, {
       id: hasId ? Number(e.id) : undefined,
       title: typeof e.title === 'string' ? e.title.trim() : undefined,
       description: typeof e.description === 'string' ? e.description : undefined,
       question: { text: e.question.trim(), options, recommended, answer: '', answeredAt: '' },
       author: authorOf(e),
+      by: actorOf(e),
     })
     return {
       result: card
@@ -596,6 +872,9 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'mcp__agent-board__board_update' }, async ($, e) => {
+    const before = (await loadCards($)).find(c => c.id === Number(e.id))
+    const held = before && heldByOther(before, actorOf(e))
+    if (held) return { result: held }
     const card = await changeCard($, Number(e.id), c => ({
       ...c,
       title: typeof e.title === 'string' && e.title.trim() ? e.title.trim() : c.title,
@@ -615,6 +894,9 @@ export const register: Register = on => {
     const openId = await read($, selected)
     const dir = await read($, boardDir)
     const open = await read($, expanded)
+    // Read so the pane redraws as agents work and as time passes.
+    await read($, activity)
+    await read($, tick)
     const width = e.props.bodyColumns
     // Graphical surfaces get filled cards; the terminal keeps thin borders.
     const isGui = e.surface !== 'terminal'
@@ -654,6 +936,15 @@ export const register: Register = on => {
         tree
       )
 
+    const holderLine = (c: Card) =>
+      !isLive(c) ? undefined : isWorking(c) ? (
+        <Text color="success">● {c.assignee} is working on this</Text>
+      ) : (
+        <Text dimColor>
+          ○ {c.assignee} · last active {lastActiveAgo(c)}
+        </Text>
+      )
+
     if (!dir) return <Text dimColor>Loading the board…</Text>
 
     const card = list.find(c => c.id === openId)
@@ -687,6 +978,12 @@ export const register: Register = on => {
             <Text dimColor>
               #{card.id} · {labelOf(card.column)} · by {card.author || 'unknown'} · updated {ago(card.updated)}
             </Text>
+            {isLive(card) && (
+              <Box flexDirection="row" columnGap={2} alignItems="center">
+                {holderLine(card)}
+                <Button key="release" label="Release" plain dimColor onPress={() => releaseCard($, card.id)} />
+              </Box>
+            )}
           </Box>
 
           {q && (
@@ -736,6 +1033,20 @@ export const register: Register = on => {
 
           {card.description ? <Markdown text={card.description} /> : <Text dimColor>No description.</Text>}
 
+          {(() => {
+            // The last handoff is what a reviewer needs first.
+            const handoff = [...card.comments].reverse().find(c => c.kind === 'handoff')
+            if (!handoff || (card.column !== 'reviewing' && card.column !== 'done')) return undefined
+            return (
+              <Box key="handoff" flexDirection="column" {...cardStyle()}>
+                <Text>
+                  <Text bold color="success">Handoff</Text> <Text dimColor>from {handoff.author} · {ago(handoff.at)}</Text>
+                </Text>
+                <Markdown text={handoff.text} />
+              </Box>
+            )
+          })()}
+
           {Select ? (
             <Select
               key="move"
@@ -762,7 +1073,8 @@ export const register: Register = on => {
             {card.comments.map((c, i) => (
               <Box key={`comment-${i}`} flexDirection="column" {...cardStyle()}>
                 <Text>
-                  <Text bold>{c.author}</Text> <Text dimColor>· {ago(c.at)}</Text>
+                  <Text bold>{c.author}</Text>
+                  {c.kind === 'handoff' && <Text color="success"> handoff</Text>} <Text dimColor>· {ago(c.at)}</Text>
                 </Text>
                 <Markdown text={c.text} />
               </Box>
@@ -817,9 +1129,9 @@ export const register: Register = on => {
 
     const tile = (c: Card) => {
       const isWaiting = c.column === 'waiting'
-      const at = COLUMN_IDS.indexOf(c.column)
-      const prev = COLUMNS[at - 1]
-      const next = COLUMNS[at + 1]
+      const at = FLOW.findIndex(f => f.id === c.column)
+      const prev = at > 0 ? FLOW[at - 1] : undefined
+      const next = at < 0 ? FLOW.find(f => f.id === 'todo') : FLOW[at + 1]
       const question = isOpenQuestion(c) ? c.question : undefined
       const meta = [`#${c.id}`, c.comments.length > 0 ? `💬 ${c.comments.length}` : '', ago(c.updated)]
         .filter(Boolean)
@@ -834,6 +1146,7 @@ export const register: Register = on => {
           <Box flexDirection="column" flexGrow={1} flexShrink={1}>
             <Button key={`card-${c.id}`} label={c.title} plain onPress={() => goTo(c.id)} />
             {question && <Text color="warning">❓ {question.text}</Text>}
+            {holderLine(c)}
             <Text dimColor>{meta}</Text>
           </Box>
           {/* Chevrons that move the card one column: centred on the tile's
@@ -908,7 +1221,7 @@ export const register: Register = on => {
               const cs = inColumn(col.id)
               return (
                 <Box key={`col-${col.id}`} flexDirection="column" flexGrow={1} flexShrink={1} width="16%" gap={1}>
-                  {heading(col, cs.length)}
+                  {heading(col, cs.length, col.id === 'waiting' ? 'Needs you' : col.label)}
                   {cs.length === 0 ? <Text dimColor>No cards</Text> : cs.map(tile)}
                 </Box>
               )

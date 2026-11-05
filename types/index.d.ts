@@ -1,6 +1,12 @@
 export type Column = 'backlog' | 'todo' | 'doing' | 'reviewing' | 'done' | 'waiting'
 
-export type Comment = { at: string; author: string; text: string }
+export type Comment = {
+  at: string
+  author: string
+  text: string
+  /** 'handoff': the summary an agent leaves when it moves a card to Reviewing or Done */
+  kind?: 'handoff'
+}
 
 export type QuestionOption = { label: string; description: string }
 
@@ -24,6 +30,11 @@ export type Card = {
   updated: string
   comments: Comment[]
   question?: Question
+  /** Who holds the card: an agent id, 'main' for the main loop; '' when unclaimed */
+  holder: string
+  /** The holder's display name */
+  assignee: string
+  claimedAt: string
 }
 
 declare module 'claude-code' {
@@ -34,6 +45,10 @@ declare module 'claude-code' {
       boardDir: string
       expanded: string[]
       confirmDelete: number
+      /** Last tool call per agent (holder id → epoch ms), for the working dot */
+      activity: Record<string, number>
+      /** Bumped every 30 s so relative times and idle states redraw */
+      tick: number
     }
   }
 }

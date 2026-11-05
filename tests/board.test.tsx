@@ -72,7 +72,9 @@ test('agents create, move and comment on cards, saved as Markdown files', async 
   expect(text(made)).toContain('#1 [Backlog] Add login page')
   await $.tool.call({ tool: 'mcp__agent-board__board_create', title: 'Write tests', column: 'todo' })
 
-  await $.tool.call({ tool: 'mcp__agent-board__board_move', id: 1, column: 'waiting' })
+  // Waiting is for questions: agents are sent to board_ask.
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_move', id: 1, column: 'waiting' }))).toContain('board_ask')
+  await $.tool.call({ tool: 'mcp__agent-board__board_move', id: 1, column: 'doing' })
   await $.tool.call({
     tool: 'mcp__agent-board__board_comment',
     id: 1,
@@ -81,11 +83,12 @@ test('agents create, move and comment on cards, saved as Markdown files', async 
   })
 
   const file = files.get('/repo/.board/cards/1.md')?.text ?? ''
-  expect(file).toContain('column: waiting')
+  expect(file).toContain('column: doing')
+  expect(file).toContain('holder: "main"')
   expect(file).toContain('**planner**')
 
   const got = text(await $.tool.call({ tool: 'mcp__agent-board__board_get', id: 1 }))
-  expect(got).toContain('[Waiting for input]')
+  expect(got).toContain('[Doing]')
   expect(got).toContain('planner')
   expect(got).toContain('### not a heading break')
   expect(got).toContain('Form with **email** and password.')
@@ -103,7 +106,7 @@ test('the pane shows columns, opens a card, and takes a comment', async ($, on) 
   for (const width of [140, 40]) {
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ ...pane(width), surface })
-      expect(await ui.find({ type: 'Text', text: width >= 132 ? /Waiting for input/ : /Doing/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: width >= 132 ? /Needs you/ : /Doing/ })).toBeDefined()
       expect(await ui.find({ key: 'card-1' })).toBeDefined()
       await ui.unmount()
     }
@@ -260,4 +263,81 @@ test('in the side panel the chevrons point up and down', async ($, on) => {
   await ui.press({ key: 'right-1' })
   expect(files.get('/repo/.board/cards/1.md')?.text).toContain('column: reviewing')
   await ui.unmount()
+})
+
+test('Waiting for input comes first and sits outside the chevron flow', async ($, on) => {
+  const files = new Map<string, { text: string; mtimeMs: number }>()
+  fakeEngine(on, files)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__agent-board__board_create', title: 'Finished', column: 'done' })
+  await $.tool.call({ tool: 'mcp__agent-board__board_create', title: 'Asking', column: 'waiting' })
+
+  const ui = await $.ui.mount({ ...pane(140), surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Needs you/ })).toBeDefined()
+  expect(await ui.find({ key: 'right-1' })).toBeUndefined()
+  expect(await ui.find({ key: 'left-2' })).toBeUndefined()
+  await ui.press({ key: 'right-2' })
+  expect(files.get('/repo/.board/cards/2.md')?.text).toContain('column: todo')
+  await ui.unmount()
+})
+
+test('claims keep agents off each other\'s cards, and handoffs are required', async ($, on) => {
+  const files = new Map<string, { text: string; mtimeMs: number }>()
+  fakeEngine(on, files)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__agent-board__board_create', title: 'First', column: 'todo' })
+  await $.tool.call({ tool: 'mcp__agent-board__board_create', title: 'Second', column: 'todo' })
+  const sub = 'abcdef1234567890'
+
+  // The main loop takes the next card; it is claimed and in Doing.
+  const got = text(await $.tool.call({ tool: 'mcp__agent-board__board_next' }))
+  expect(got).toContain('#1 [Doing] First')
+  expect(files.get('/repo/.board/cards/1.md')?.text).toContain('holder: "main"')
+  // One unfinished card at a time.
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_next' }))).toContain('You already hold #1')
+
+  // A subagent can't move, edit or claim it, but can comment.
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_move', id: 1, column: 'todo', agentId: sub }))).toContain('claimed by claude')
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_update', id: 1, title: 'Hijack', agentId: sub }))).toContain('Refused')
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_claim', id: 1, agentId: sub }))).toContain('Refused')
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_comment', id: 1, text: 'FYI', agentId: sub }))).toContain('Commented')
+  // board_next skips the held card.
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_next', agentId: sub }))).toContain('#2 [Doing] Second')
+
+  // No summary, no Reviewing; with one, it is handed off and released.
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_move', id: 1, column: 'reviewing' }))).toContain('needs a summary')
+  await $.tool.call({ tool: 'mcp__agent-board__board_move', id: 1, column: 'reviewing', summary: 'Added the form in login.tsx' })
+  const file = files.get('/repo/.board/cards/1.md')?.text ?? ''
+  expect(file).toContain('column: reviewing')
+  expect(file).toContain('kind="handoff"')
+  expect(file).not.toContain('holder:')
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_get', id: 1 }))).toContain('(handoff)')
+
+  // The pane shows who works on what, and the handoff on the reviewed card.
+  const ui = await $.ui.mount({ ...pane(140), surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /subagent abcdef12 is working/ })).toBeDefined()
+  await ui.press({ key: 'card-1' })
+  expect(await ui.find({ type: 'Text', text: /Handoff/ })).toBeDefined()
+  await ui.press({ key: 'back' })
+  // The user can release a claim from the card view.
+  await ui.press({ key: 'card-2' })
+  await ui.press({ key: 'release' })
+  expect(files.get('/repo/.board/cards/2.md')?.text).not.toContain('holder:')
+  await ui.unmount()
+})
+
+test('a subagent that ends while holding a card gives it back', async ($, on) => {
+  const files = new Map<string, { text: string; mtimeMs: number }>()
+  fakeEngine(on, files)
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__agent-board__board_create', title: 'Left behind', column: 'todo' })
+  await $.tool.call({ tool: 'mcp__agent-board__board_next', agentId: 'deadbeef00' })
+  expect(files.get('/repo/.board/cards/1.md')?.text).toContain('column: doing')
+
+  await $.turn.complete({ agentId: 'deadbeef00', reason: 'answer', answer: 'done', durationMs: 1, isAborted: false } as never)
+  const file = files.get('/repo/.board/cards/1.md')?.text ?? ''
+  expect(file).toContain('column: todo')
+  expect(file).toContain('Released automatically')
+  expect(file).not.toContain('holder:')
 })
