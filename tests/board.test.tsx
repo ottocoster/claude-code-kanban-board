@@ -341,3 +341,58 @@ test('a subagent that ends while holding a card gives it back', async ($, on) =>
   expect(file).toContain('Released automatically')
   expect(file).not.toContain('holder:')
 })
+
+test('a checklist in the description: agents and the user tick it, the tile shows progress', async ($, on) => {
+  const files = new Map<string, { text: string; mtimeMs: number }>()
+  fakeEngine(on, files)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.tool.call({
+    tool: 'mcp__agent-board__board_create',
+    title: 'Login page',
+    column: 'todo',
+    description: 'The form.\n\n- [ ] Email field\n- [x] Password field\n- [ ] Error message\n\n```\n- [ ] not a task, in code\n```',
+  })
+  const path = '/repo/.board/cards/1.md'
+
+  // board_get numbers the items; code blocks don't count.
+  const got = text(await $.tool.call({ tool: 'mcp__agent-board__board_get', id: 1 }))
+  expect(got).toContain('Checklist (1/3 done')
+  expect(got).toContain('1. [ ] Email field')
+  expect(got).not.toContain('4. ')
+
+  // An agent ticks by number or by text; a wrong item lists the checklist.
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_check', id: 1, item: 1 }))).toContain('2/3 done')
+  expect(files.get(path)?.text).toContain('- [x] Email field')
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_check', id: 1, item: 'password', done: false }))).toContain('1/3 done')
+  expect(files.get(path)?.text).toContain('- [ ] Password field')
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_check', id: 1, item: 9 }))).toContain('3. [ ] Error message')
+  expect(files.get(path)?.text).toContain('- [ ] not a task, in code')
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_list' }))).toContain('(1/3 checked)')
+
+  // Someone else's claim keeps an agent's hands off it.
+  await $.tool.call({ tool: 'mcp__agent-board__board_claim', id: 1 })
+  expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_check', id: 1, item: 3, agentId: 'other123456' }))).toContain('Refused')
+
+  // The tile shows progress in both layouts, on both surfaces.
+  for (const width of [140, 50]) {
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ ...pane(width), surface })
+      expect(await ui.find({ type: 'Text', text: /☑ 1\/3/ })).toBeDefined()
+      await ui.unmount()
+    }
+  }
+
+  // The user ticks in the card view; the task lines leave the Markdown.
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...pane(140), surface })
+    await ui.press({ key: 'card-1' })
+    expect((await ui.find({ key: 'check-2' }))?.text).toContain('☐ Error message')
+    await ui.press({ key: 'check-2' })
+    expect(files.get(path)?.text).toContain('- [x] Error message')
+    expect((await ui.find({ key: 'check-2' }))?.text).toContain('☑ Error message')
+    await ui.press({ key: 'check-2' })
+    expect(files.get(path)?.text).toContain('- [ ] Error message')
+    await ui.press({ key: 'back' })
+    await ui.unmount()
+  }
+})

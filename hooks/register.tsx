@@ -303,6 +303,11 @@ async function addComment(
   }))
 }
 
+// Tick or untick one checklist item (0-based) by rewriting its line.
+async function checkTask($: Engine, id: number, index: number, done: boolean): Promise<Card | undefined> {
+  return changeCard($, id, c => ({ ...c, description: setTask(c.description, index, done) }))
+}
+
 async function askQuestion(
   $: Engine,
   input: { id?: number; title?: string; description?: string; question: Question; author: string; by?: Actor },
@@ -405,13 +410,69 @@ async function findBoardDir($: Engine): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Checklist: the Markdown task items (`- [ ] …`, `- [x] …`) in a card's
+// description. They stay in the description, so the file is plain Markdown
+// and a hand edit is a tick too; ticking rewrites that one line.
+
+const TASK_RE = /^(\s*[-*+]\s+\[)([ xX])(\]\s+)(.*)$/
+type Task = { text: string; done: boolean; line: number }
+
+function tasksOf(description: string): Task[] {
+  const out: Task[] = []
+  let inFence = false
+  description.split('\n').forEach((text, line) => {
+    if (/^\s*(```|~~~)/.test(text)) inFence = !inFence
+    const m = inFence ? null : TASK_RE.exec(text)
+    if (m) out.push({ text: (m[4] ?? '').trim(), done: m[2] !== ' ', line })
+  })
+  return out
+}
+
+function setTask(description: string, index: number, done: boolean): string {
+  const task = tasksOf(description)[index]
+  if (!task) return description
+  const lines = description.split('\n')
+  lines[task.line] = (lines[task.line] ?? '').replace(TASK_RE, (_, open, _mark, close, rest) => `${open}${done ? 'x' : ' '}${close}${rest}`)
+  return lines.join('\n')
+}
+
+// The description with its task lines taken out: the card view draws those
+// as checkboxes of their own.
+function withoutTasks(description: string): string {
+  const lines = description.split('\n')
+  const drop = new Set(tasksOf(description).map(t => t.line))
+  return lines.filter((_, i) => !drop.has(i)).join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function progressOf(card: Card): { done: number; total: number } {
+  const tasks = tasksOf(card.description)
+  return { done: tasks.filter(t => t.done).length, total: tasks.length }
+}
+
+// Which task an agent means: its 1-based number, or (part of) its text.
+function findTask(tasks: Task[], item: unknown): number {
+  if (typeof item === 'number' || (typeof item === 'string' && /^\d+$/.test(item.trim()))) {
+    const n = Number(item) - 1
+    return n >= 0 && n < tasks.length ? n : -1
+  }
+  if (typeof item !== 'string' || !item.trim()) return -1
+  const want = item.trim().toLowerCase()
+  const exact = tasks.findIndex(t => t.text.toLowerCase() === want)
+  return exact >= 0 ? exact : tasks.findIndex(t => t.text.toLowerCase().includes(want))
+}
+
+const checklistLines = (tasks: Task[]) => tasks.map((t, i) => `${i + 1}. [${t.done ? 'x' : ' '}] ${t.text}`)
+
+// ---------------------------------------------------------------------------
 // Text the model reads back from the tools.
 
 function summary(card: Card): string {
   const n = card.comments.length
   const q = isOpenQuestion(card) ? ' (question open)' : ''
   const by = isLive(card) ? ` (claimed by ${card.assignee})` : ''
-  return `#${card.id} [${labelOf(card.column)}] ${card.title}${n ? ` (${n} comment${n === 1 ? '' : 's'})` : ''}${q}${by}`
+  const p = progressOf(card)
+  const checked = p.total ? ` (${p.done}/${p.total} checked)` : ''
+  return `#${card.id} [${labelOf(card.column)}] ${card.title}${n ? ` (${n} comment${n === 1 ? '' : 's'})` : ''}${checked}${q}${by}`
 }
 
 function full(card: Card): string {
@@ -422,6 +483,11 @@ function full(card: Card): string {
     '',
     card.description || '(no description)',
   ]
+  const tasks = tasksOf(card.description)
+  if (tasks.length > 0) {
+    const p = progressOf(card)
+    parts.push('', `Checklist (${p.done}/${p.total} done; tick items with board_check):`, ...checklistLines(tasks))
+  }
   if (card.question) {
     const q = card.question
     parts.push('', `Question: ${q.text}`)
@@ -579,7 +645,8 @@ const BOARD_NOTE =
   'The board is shared by the user, the main Claude and every subagent, and is saved as Markdown files in the repo under .board/cards/. ' +
   'Columns: backlog, todo, doing, reviewing, done, waiting (waiting = waiting for input from the user). ' +
   'Before working on a card, take one with board_next (or board_claim a specific one): it moves to doing and only you can move or edit it. ' +
-  'Moving to reviewing or done needs a summary, which hands the card off and releases it.'
+  'Moving to reviewing or done needs a summary, which hands the card off and releases it. ' +
+  "A card's `- [ ]` lines are its acceptance criteria: tick each with board_check once you have verified it."
 
 // ---------------------------------------------------------------------------
 
@@ -688,6 +755,26 @@ export const register: Register = on => {
         type: 'object',
         properties: { id: { type: 'integer' }, title: { type: 'string' }, description: { type: 'string' } },
         required: ['id'],
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'board_check',
+      description:
+        "Tick (or untick) an item on a card's acceptance-criteria checklist: the Markdown task lines (`- [ ] …`) in its description. " +
+        'board_get lists them numbered. Tick an item only once you have verified it holds. ' +
+        'To add items, put `- [ ] …` lines in the description with board_update.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          item: {
+            type: ['integer', 'string'],
+            description: "The item's number as board_get lists it (1 is the first), or its text",
+          },
+          done: { type: 'boolean', description: 'true ticks the item (the default), false unticks it' },
+        },
+        required: ['id', 'item'],
       },
       isDeferred: false,
     })
@@ -834,6 +921,33 @@ export const register: Register = on => {
     return { result: card ? `Released ${summary(card)}. Say why in a board_comment.` : (error ?? '') }
   })
 
+  on('tool.call', { tool: 'mcp__agent-board__board_check' }, async ($, e) => {
+    const by = actorOf(e)
+    touch($, by.holder)
+    const before = (await loadCards($)).find(c => c.id === Number(e.id))
+    if (!before) return { result: `No card #${String(e.id)}.` }
+    const held = heldByOther(before, by)
+    if (held) return { result: held }
+    const tasks = tasksOf(before.description)
+    if (tasks.length === 0) {
+      return { result: `#${before.id} has no checklist. Add \`- [ ] …\` lines to its description with board_update.` }
+    }
+    const index = findTask(tasks, e.item)
+    if (index < 0) {
+      return { result: `No item ${JSON.stringify(e.item)} on #${before.id}. Its checklist:\n${checklistLines(tasks).join('\n')}` }
+    }
+    const done = e.done !== false
+    const card = await checkTask($, before.id, index, done)
+    if (!card) return { result: `No card #${String(e.id)}.` }
+    const p = progressOf(card)
+    const left = tasksOf(card.description).filter(t => !t.done)
+    return {
+      result:
+        `${done ? 'Ticked' : 'Unticked'} "${tasks[index]?.text ?? ''}" on #${card.id}: ${p.done}/${p.total} done.` +
+        (left.length ? `\nStill open:\n${left.map(t => `- ${t.text}`).join('\n')}` : '\nEvery item is ticked.'),
+    }
+  })
+
   on('tool.call', { tool: 'mcp__agent-board__board_comment' }, async ($, e) => {
     if (typeof e.text !== 'string' || !e.text.trim()) return { result: 'Comment text is required.' }
     const card = await addComment($, Number(e.id), authorOf(e), e.text)
@@ -915,6 +1029,36 @@ export const register: Register = on => {
             borderColor: isAccent ? 'warning' : 'subtle',
             paddingX: 1,
           }
+
+    // A plain Button whose text wraps. A label is drawn on one line; a Text
+    // child wraps. Builds before 2.1.317 refuse children, so the terminal
+    // keeps the label.
+    const wrapButton = (key: string, label: string, onPress: () => unknown, dim = false) =>
+      isGui ? (
+        <Button key={key} plain onPress={() => void onPress()}>
+          <Text wrap="wrap" dimColor={dim}>
+            {label}
+          </Text>
+        </Button>
+      ) : (
+        <Button key={key} label={label} plain dimColor={dim || undefined} onPress={() => void onPress()} />
+      )
+
+    // A thin progress bar of ten segments, then "☑ 3/5".
+    const progress = (c: Card) => {
+      const p = progressOf(c)
+      if (p.total === 0) return undefined
+      const filled = Math.round((p.done / p.total) * 10)
+      return (
+        <Text>
+          <Text color="success">{'━'.repeat(filled)}</Text>
+          <Text dimColor>{'━'.repeat(10 - filled)}</Text>
+          <Text dimColor>
+            {' '}☑ {p.done}/{p.total}
+          </Text>
+        </Text>
+      )
+    }
 
     // The tint lives on a Box of our own: a pane's backgroundColor is only a
     // request, and an already-open pane keeps the look it opened with.
@@ -1031,7 +1175,27 @@ export const register: Register = on => {
             </Box>
           )}
 
-          {card.description ? <Markdown text={card.description} /> : <Text dimColor>No description.</Text>}
+          {(() => {
+            const tasks = tasksOf(card.description)
+            const rest = tasks.length ? withoutTasks(card.description) : card.description
+            const p = progressOf(card)
+            return (
+              <Box key="body" flexDirection="column" gap={1}>
+                {rest ? <Markdown text={rest} /> : !tasks.length && <Text dimColor>No description.</Text>}
+                {tasks.length > 0 && (
+                  <Box key="checklist" flexDirection="column">
+                    <Text bold>
+                      Checklist <Text dimColor>{p.done}/{p.total}</Text>
+                    </Text>
+                    {progress(card)}
+                    {tasks.map((t, i) =>
+                      wrapButton(`check-${i}`, `${t.done ? '☑' : '☐'} ${t.text}`, () => checkTask($, card.id, i, !t.done), t.done),
+                    )}
+                  </Box>
+                )}
+              </Box>
+            )
+          })()}
 
           {(() => {
             // The last handoff is what a reviewer needs first.
@@ -1141,12 +1305,17 @@ export const register: Register = on => {
           key={`tile-${c.id}`}
           flexDirection="row"
           alignItems="center"
+          minWidth={0}
+          overflow="hidden"
           {...cardStyle(isWaiting)}
         >
-          <Box flexDirection="column" flexGrow={1} flexShrink={1}>
-            <Button key={`card-${c.id}`} label={c.title} plain onPress={() => goTo(c.id)} />
+          {/* minWidth 0 lets the title shrink to the tile so it wraps, instead
+              of a one-line label pushing past the tile's edge. */}
+          <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+            {wrapButton(`card-${c.id}`, c.title, () => goTo(c.id))}
             {question && <Text color="warning">❓ {question.text}</Text>}
             {holderLine(c)}
+            {progress(c)}
             <Text dimColor>{meta}</Text>
           </Box>
           {/* Chevrons that move the card one column: centred on the tile's
@@ -1219,8 +1388,11 @@ export const register: Register = on => {
           <Box flexDirection="row" columnGap={1}>
             {COLUMNS.map(col => {
               const cs = inColumn(col.id)
+              // Empty columns keep just room for their heading; the columns
+              // with cards share the rest equally.
+              const size = cs.length === 0 ? { width: 14, flexShrink: 0 } : { width: 0, flexGrow: 1, minWidth: 0 }
               return (
-                <Box key={`col-${col.id}`} flexDirection="column" flexGrow={1} flexShrink={1} width="16%" gap={1}>
+                <Box key={`col-${col.id}`} flexDirection="column" gap={1} {...size}>
                   {heading(col, cs.length, col.id === 'waiting' ? 'Needs you' : col.label)}
                   {cs.length === 0 ? <Text dimColor>No cards</Text> : cs.map(tile)}
                 </Box>
