@@ -19,9 +19,11 @@ const pane = (bodyColumns: number) =>
 // The engine beneath the plugin: an in-memory repo at /repo.
 function fakeEngine(on: On, files: Map<string, { text: string; mtimeMs: number }>) {
   let tick = 1
-  on('session.root', () => ({ value: '/repo' }))
+  on('session.root', () => ({ value: fakeRoot }))
   on('process.run', (_, e) => {
     if (e.argv[0] === 'rm') files.delete(String(e.argv.at(-1)))
+    // Only /repo is a git repository.
+    if (e.argv[0] === 'git' && e.argv[2] !== '/repo') return { value: { exitCode: 128, stdout: '', stderr: 'not a git repository' } }
     return { value: { exitCode: 0, stdout: e.argv[0] === 'git' ? '/repo\n' : '', stderr: '' } }
   })
   on('fs.write', (_, e) => {
@@ -56,6 +58,7 @@ function fakeEngine(on: On, files: Map<string, { text: string; mtimeMs: number }
   return mock.clock(on)
 }
 
+let fakeRoot = '/repo'
 const submitted: string[] = []
 const text = (r: unknown) => String((r as { result?: unknown }).result)
 
@@ -394,5 +397,23 @@ test('a checklist in the description: agents and the user tick it, the tile show
     expect(files.get(path)?.text).toContain('- [ ] Error message')
     await ui.press({ key: 'back' })
     await ui.unmount()
+  }
+})
+
+test('the board follows the session root when it moves after start', async ($, on) => {
+  const files = new Map<string, { text: string; mtimeMs: number }>()
+  files.set('/repo/.board/cards/1.md', {
+    text: '---\nid: 1\ntitle: "Existing card"\ncolumn: todo\nauthor: "claude"\ncreated: x\nupdated: x\n---\n',
+    mtimeMs: 1,
+  })
+  fakeEngine(on, files)
+  fakeRoot = '/spare'
+  try {
+    await $.session.start({ cwd: '/spare', surface: 'desktop', isInteractive: true })
+    expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_list' }))).toBe('The board is empty.')
+    fakeRoot = '/repo'
+    expect(text(await $.tool.call({ tool: 'mcp__agent-board__board_list' }))).toContain('Existing card')
+  } finally {
+    fakeRoot = '/repo'
   }
 })

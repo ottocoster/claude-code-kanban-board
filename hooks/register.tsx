@@ -167,7 +167,7 @@ function parseQuestion(raw: string): Question | undefined {
 const cache = new Map<string, { mtimeMs: number; card: Card | undefined }>()
 
 async function loadCards($: Engine): Promise<Card[]> {
-  const dir = await read($, boardDir)
+  const dir = await currentBoardDir($)
   if (!dir || !(await $.fs.exists(dir))) return []
   const entries = await $.fs.list(dir)
   const out: Card[] = []
@@ -206,7 +206,7 @@ function locked<T>(work: () => Promise<T>): Promise<T> {
 const now = () => new Date().toISOString().replace(/\.\d+Z$/, 'Z')
 
 async function saveCard($: Engine, card: Card): Promise<void> {
-  const dir = await read($, boardDir)
+  const dir = await currentBoardDir($)
   await $.fs.write(`${dir}/${card.id}.md`, serialize(card))
 }
 
@@ -388,7 +388,7 @@ async function answerQuestion($: Engine, id: number, answer: string): Promise<vo
 async function deleteCard($: Engine, id: number): Promise<boolean> {
   if (!Number.isInteger(id) || id <= 0) return false
   return locked(async () => {
-    const dir = await read($, boardDir)
+    const dir = await currentBoardDir($)
     const name = `${id}.md`
     if (!dir || !(await $.fs.exists(`${dir}/${name}`))) return false
     const rm = await $.process.run(['rm', '-f', '--', `${dir}/${name}`])
@@ -398,8 +398,22 @@ async function deleteCard($: Engine, id: number): Promise<boolean> {
   })
 }
 
-async function findBoardDir($: Engine): Promise<string> {
+// The session root the board folder was last resolved from. The root can move
+// after session.start (a host directory change, /cd, a worktree move), so the
+// folder is resolved again whenever it differs.
+let resolvedRoot = ''
+
+async function currentBoardDir($: Engine): Promise<string> {
   const root = await $.session.root()
+  const dir = await read($, boardDir)
+  if (dir && root === resolvedRoot) return dir
+  const next = await findBoardDir($, root)
+  resolvedRoot = root
+  if (next !== dir) await update($, boardDir, () => next)
+  return next
+}
+
+async function findBoardDir($: Engine, root: string): Promise<string> {
   try {
     const git = await $.process.run(['git', '-C', root, 'rev-parse', '--show-toplevel'])
     if (git.exitCode === 0 && git.stdout.trim()) return `${git.stdout.trim()}/${CARDS_DIR}`
@@ -652,9 +666,8 @@ const BOARD_NOTE =
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await update($, boardDir, () => '')
-    const dir = await findBoardDir($)
-    await update($, boardDir, () => dir)
+    resolvedRoot = ''
+    const dir = await currentBoardDir($)
     await refresh($)
 
     await $.tool.register({
@@ -1030,19 +1043,12 @@ export const register: Register = on => {
             paddingX: 1,
           }
 
-    // A plain Button whose text wraps. A label is drawn on one line; a Text
-    // child wraps. Builds before 2.1.317 refuse children, so the terminal
-    // keeps the label.
-    const wrapButton = (key: string, label: string, onPress: () => unknown, dim = false) =>
-      isGui ? (
-        <Button key={key} plain onPress={() => void onPress()}>
-          <Text wrap="wrap" dimColor={dim}>
-            {label}
-          </Text>
-        </Button>
-      ) : (
-        <Button key={key} label={label} plain dimColor={dim || undefined} onPress={() => void onPress()} />
-      )
+    // A plain Button. It used to wrap its text in a Text child on graphical
+    // surfaces, but 2.1.317 takes only a label or one string child, so every
+    // surface gets the label, drawn on one line.
+    const wrapButton = (key: string, label: string, onPress: () => unknown, dim = false) => (
+      <Button key={key} label={label} plain dimColor={dim || undefined} onPress={() => void onPress()} />
+    )
 
     // A thin progress bar of ten segments, then "☑ 3/5".
     const progress = (c: Card) => {
